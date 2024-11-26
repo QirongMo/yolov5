@@ -4,6 +4,7 @@
 import contextlib
 import platform
 import threading
+import time
 
 
 def emojis(str=""):
@@ -63,8 +64,7 @@ def notebook_init(verbose=True):
 
     import os
     import shutil
-
-    from ultralytics.utils.checks import check_requirements
+    from utils.general import check_requirements
 
     from utils.general import check_font, is_colab
     from utils.torch_utils import select_device  # imports
@@ -95,3 +95,43 @@ def notebook_init(verbose=True):
     select_device(newline=False)
     print(emojis(f"Setup complete ✅ {s}"))
     return display
+
+class Retry(contextlib.ContextDecorator):
+    """
+    Retry class for function execution with exponential backoff.
+
+    Can be used as a decorator to retry a function on exceptions, up to a specified number of times with an
+    exponentially increasing delay between retries.
+
+    Examples:
+        Example usage as a decorator:
+        >>> @Retry(times=3, delay=2)
+        >>> def test_func():
+        >>>     # Replace with function logic that may raise exceptions
+        >>>     return True
+    """
+
+    def __init__(self, times=3, delay=2):
+        """Initialize Retry class with specified number of retries and delay."""
+        self.times = times
+        self.delay = delay
+        self._attempts = 0
+
+    def __call__(self, func):
+        """Decorator implementation for Retry with exponential backoff."""
+
+        def wrapped_func(*args, **kwargs):
+            """Applies retries to the decorated function or method."""
+            self._attempts = 0
+            while self._attempts < self.times:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    self._attempts += 1
+                    print(f"Retry {self._attempts}/{self.times} failed: {e}")
+                    if self._attempts >= self.times:
+                        raise e
+                    time.sleep(self.delay * (2**self._attempts))  # exponential backoff delay
+
+        return wrapped_func
+    

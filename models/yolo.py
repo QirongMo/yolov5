@@ -49,6 +49,11 @@ from models.common import (
     GhostConv,
     Proto,
 )
+from models.yolov8 import C2f
+from models.yolov10 import PSA, C2fCIB, SCDown
+from models.yolo11 import C2PSA, C3k2
+from models.yolov5 import DecoupledDetect
+
 from models.experimental import MixConv2d
 from utils.autoanchor import check_anchor_order
 from utils.general import LOGGER, check_version, check_yaml, colorstr, make_divisible, print_args
@@ -88,6 +93,7 @@ class Detect(nn.Module):
         self.register_buffer("anchors", torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
         self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+        self.no_decode = False
 
     def forward(self, x):
         """Processes input through YOLOv5 layers, altering shape for detection: `x(bs, 3, ny, nx, 85)`."""
@@ -113,7 +119,7 @@ class Detect(nn.Module):
                     y = torch.cat((xy, wh, conf), 4)
                 z.append(y.view(bs, self.na * nx * ny, self.no))
 
-        return x if self.training else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
+        return x if self.training or self.no_decode else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
 
     def _make_grid(self, nx=20, ny=20, i=0, torch_1_10=check_version(torch.__version__, "1.10.0")):
         """Generates a mesh grid for anchor boxes with optional compatibility for torch versions < 1.10."""
@@ -207,7 +213,7 @@ class BaseModel(nn.Module):
         """
         self = super()._apply(fn)
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Segment)):
+        if isinstance(m, (Detect, Segment, DecoupledDetect)):
             m.stride = fn(m.stride)
             m.grid = list(map(fn, m.grid))
             if isinstance(m.anchor_grid, list):
@@ -217,7 +223,7 @@ class BaseModel(nn.Module):
 
 class DetectionModel(BaseModel):
     """YOLOv5 detection model class for object detection tasks, supporting custom configurations and anchors."""
-
+    
     def __init__(self, cfg="yolov5s.yaml", ch=3, nc=None, anchors=None):
         """Initializes YOLOv5 model with configuration file, input channels, number of classes, and custom anchors."""
         super().__init__()
@@ -244,8 +250,8 @@ class DetectionModel(BaseModel):
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Segment)):
-
+        if isinstance(m, (Detect, Segment, DecoupledDetect)):
+            
             def _forward(x):
                 """Passes the input 'x' through the model and returns the processed output."""
                 return self.forward(x)[0] if isinstance(m, Segment) else self.forward(x)
@@ -322,29 +328,31 @@ class DetectionModel(BaseModel):
         """
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
         m = self.model[-1]  # Detect() module
-        for mi, s in zip(m.m, m.stride):  # from
-            b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
-            b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b.data[:, 5 : 5 + m.nc] += (
-                math.log(0.6 / (m.nc - 0.99999)) if cf is None else torch.log(cf / cf.sum())
-            )  # cls
-            mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
-
-
+        if isinstance(m, (Detect, Segment)):
+            for mi, s in zip(m.m, m.stride):  # from
+                b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
+                b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
+                b.data[:, 5 : 5 + m.nc] += (
+                    math.log(0.6 / (m.nc - 0.99999)) if cf is None else torch.log(cf / cf.sum())
+                )  # cls
+                mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+        elif isinstance(m, (DecoupledDetect)):
+            m.bias_init(cf)
+            
 Model = DetectionModel  # retain YOLOv5 'Model' class for backwards compatibility
 
 
 class SegmentationModel(DetectionModel):
     """YOLOv5 segmentation model for object detection and segmentation tasks with configurable parameters."""
-
+    
     def __init__(self, cfg="yolov5s-seg.yaml", ch=3, nc=None, anchors=None):
         """Initializes a YOLOv5 segmentation model with configurable params: cfg (str) for configuration, ch (int) for channels, nc (int) for num classes, anchors (list)."""
         super().__init__(cfg, ch, nc, anchors)
 
 
 class ClassificationModel(BaseModel):
-    """YOLOv5 classification model for image classification tasks, initialized with a config file or detection model."""
-
+    """YOLOv5 classification model for image classification tasks, initialized with a config file or detection model.""" 
+    
     def __init__(self, cfg=None, model=None, nc=1000, cutoff=10):
         """Initializes YOLOv5 model with config file `cfg`, input channels `ch`, number of classes `nc`, and `cuttoff`
         index.
@@ -385,6 +393,7 @@ def parse_model(d, ch):
         d.get("activation"),
         d.get("channel_multiple"),
     )
+    max_channels = d.get("max_channels", float("inf"))
     if act:
         Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = nn.SiLU()
         LOGGER.info(f"{colorstr('activation:')} {act}")  # print
@@ -420,13 +429,15 @@ def parse_model(d, ch):
             nn.ConvTranspose2d,
             DWConvTranspose2d,
             C3x,
+            C2f, SCDown, C2fCIB, PSA,
+            C3k2, C2PSA, 
         }:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
-                c2 = make_divisible(c2 * gw, ch_mul)
+                c2 = make_divisible(min(c2, max_channels) * gw, ch_mul)
 
             args = [c1, c2, *args[1:]]
-            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x}:
+            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x, C2f, C2fCIB}:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
@@ -434,12 +445,12 @@ def parse_model(d, ch):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         # TODO: channel, gw, gd
-        elif m in {Detect, Segment}:
+        elif m in {Detect, Segment, DecoupledDetect}:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
             if m is Segment:
-                args[3] = make_divisible(args[3] * gw, ch_mul)
+                args[3] = make_divisible(min(args[3], max_channels) * gw, ch_mul)
         elif m is Contract:
             c2 = ch[f] * args[0] ** 2
         elif m is Expand:

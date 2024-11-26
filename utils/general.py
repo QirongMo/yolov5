@@ -34,20 +34,13 @@ import torch
 import torchvision
 import yaml
 
-# Import 'ultralytics' package or install if missing
-try:
-    import ultralytics
-
-    assert hasattr(ultralytics, "__version__")  # verify package is not directory
-except (ImportError, AssertionError):
-    os.system("pip install -U ultralytics")
-    import ultralytics
-
-from ultralytics.utils.checks import check_requirements
-
-from utils import TryExcept, emojis
+from utils import TryExcept, emojis, Retry
 from utils.downloads import curl_download, gsutil_getsize
 from utils.metrics import box_iou, fitness
+from importlib import metadata
+from types import SimpleNamespace
+
+TORCHVISION_VERSION = metadata.version("torchvision")  # faster than importing torchvision
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
@@ -369,54 +362,146 @@ def git_describe(path=ROOT):
         return ""
 
 
-@TryExcept()
-@WorkingDirectory(ROOT)
-def check_git_status(repo="ultralytics/yolov5", branch="master"):
-    """Checks if YOLOv5 code is up-to-date with the repository, advising 'git pull' if behind; errors return informative
-    messages.
+def parse_requirements(file_path=ROOT.parent / "requirements.txt", package=""):
     """
-    url = f"https://github.com/{repo}"
-    msg = f", for updates see {url}"
-    s = colorstr("github: ")  # string
-    assert Path(".git").exists(), s + "skipping check (not a git repository)" + msg
-    assert check_online(), s + "skipping check (offline)" + msg
+    Parse a requirements.txt file, ignoring lines that start with '#' and any text after '#'.
 
-    splits = re.split(pattern=r"\s", string=check_output("git remote -v", shell=True).decode())
-    matches = [repo in s for s in splits]
-    if any(matches):
-        remote = splits[matches.index(True) - 1]
+    Args:
+        file_path (Path): Path to the requirements.txt file.
+        package (str, optional): Python package to use instead of requirements.txt file, i.e. package='ultralytics'.
+
+    Returns:
+        (List[Dict[str, str]]): List of parsed requirements as dictionaries with `name` and `specifier` keys.
+
+    Example:
+        ```python
+        from ultralytics.utils.checks import parse_requirements
+
+        parse_requirements(package='ultralytics')
+        ```
+    """
+
+    if package:
+        requires = [x for x in metadata.distribution(package).requires if "extra == " not in x]
     else:
-        remote = "ultralytics"
-        check_output(f"git remote add {remote} {url}", shell=True)
-    check_output(f"git fetch {remote}", shell=True, timeout=5)  # git fetch
-    local_branch = check_output("git rev-parse --abbrev-ref HEAD", shell=True).decode().strip()  # checked out
-    n = int(check_output(f"git rev-list {local_branch}..{remote}/{branch} --count", shell=True))  # commits behind
-    if n > 0:
-        pull = "git pull" if remote == "origin" else f"git pull {remote} {branch}"
-        s += f"⚠️ YOLOv5 is out of date by {n} commit{'s' * (n > 1)}. Use '{pull}' or 'git clone {url}' to update."
-    else:
-        s += f"up to date with {url} ✅"
-    LOGGER.info(s)
+        requires = Path(file_path).read_text().splitlines()
+
+    requirements = []
+    for line in requires:
+        line = line.strip()
+        if line and not line.startswith("#"):
+            line = line.split("#")[0].strip()  # ignore inline comments
+            match = re.match(r"([a-zA-Z0-9-_]+)\s*([<>!=~]+.*)?", line)
+            if match:
+                requirements.append(SimpleNamespace(name=match[1], specifier=match[2].strip() if match[2] else ""))
+
+    return requirements
 
 
-@WorkingDirectory(ROOT)
-def check_git_info(path="."):
-    """Checks YOLOv5 git info, returning a dict with remote URL, branch name, and commit hash."""
-    check_requirements("gitpython")
-    import git
+def check_torchvision():
+    """
+    Checks the installed versions of PyTorch and Torchvision to ensure they're compatible.
 
-    try:
-        repo = git.Repo(path)
-        remote = repo.remotes.origin.url.replace(".git", "")  # i.e. 'https://github.com/ultralytics/yolov5'
-        commit = repo.head.commit.hexsha  # i.e. '3134699c73af83aac2a481435550b968d5792c0d'
+    This function checks the installed versions of PyTorch and Torchvision, and warns if they're incompatible according
+    to the provided compatibility table based on:
+    https://github.com/pytorch/vision#installation.
+
+    The compatibility table is a dictionary where the keys are PyTorch versions and the values are lists of compatible
+    Torchvision versions.
+    """
+
+    # Compatibility table
+    compatibility_table = {
+        "2.3": ["0.18"],
+        "2.2": ["0.17"],
+        "2.1": ["0.16"],
+        "2.0": ["0.15"],
+        "1.13": ["0.14"],
+        "1.12": ["0.13"],
+    }
+
+    # Extract only the major and minor versions
+    v_torch = ".".join(torch.__version__.split("+")[0].split(".")[:2])
+    if v_torch in compatibility_table:
+        compatible_versions = compatibility_table[v_torch]
+        v_torchvision = ".".join(TORCHVISION_VERSION.split("+")[0].split(".")[:2])
+        if all(v_torchvision != v for v in compatible_versions):
+            print(
+                f"WARNING ⚠️ torchvision=={v_torchvision} is incompatible with torch=={v_torch}.\n"
+                f"Run 'pip install torchvision=={compatible_versions[0]}' to fix torchvision or "
+                "'pip install -U torch torchvision' to update both.\n"
+                "For a full compatibility table see https://github.com/pytorch/vision#installation"
+            )
+
+@TryExcept()
+def check_requirements(requirements=ROOT.parent / "requirements.txt", exclude=(), install=True, cmds=""):
+    """
+    Check if installed dependencies meet YOLOv8 requirements and attempt to auto-update if needed.
+
+    Args:
+        requirements (Union[Path, str, List[str]]): Path to a requirements.txt file, a single package requirement as a
+            string, or a list of package requirements as strings.
+        exclude (Tuple[str]): Tuple of package names to exclude from checking.
+        install (bool): If True, attempt to auto-update packages that don't meet requirements.
+        cmds (str): Additional commands to pass to the pip install command when auto-updating.
+
+    Example:
+        ```python
+        # Check a requirements.txt file
+        check_requirements('path/to/requirements.txt')
+
+        # Check a single package
+        check_requirements('ultralytics>=8.0.0')
+
+        # Check multiple packages
+        check_requirements(['numpy', 'ultralytics>=8.0.0'])
+        ```
+    """
+
+    prefix = colorstr("red", "bold", "requirements:")
+    check_python()  # check python version
+    check_torchvision()  # check torch-torchvision compatibility
+    if isinstance(requirements, Path):  # requirements.txt file
+        file = requirements.resolve()
+        assert file.exists(), f"{prefix} {file} not found, check failed."
+        requirements = [f"{x.name}{x.specifier}" for x in parse_requirements(file) if x.name not in exclude]
+    elif isinstance(requirements, str):
+        requirements = [requirements]
+
+    pkgs = []
+    for r in requirements:
+        r_stripped = r.split("/")[-1].replace(".git", "")  # replace git+https://org/repo.git -> 'repo'
+        match = re.match(r"([a-zA-Z0-9-_]+)([<>!=~]+.*)?", r_stripped)
+        name, required = match[1], match[2].strip() if match[2] else ""
         try:
-            branch = repo.active_branch.name  # i.e. 'main'
-        except TypeError:  # not on any branch
-            branch = None  # i.e. 'detached HEAD' state
-        return {"remote": remote, "branch": branch, "commit": commit}
-    except git.exc.InvalidGitRepositoryError:  # path is not a git dir
-        return {"remote": None, "branch": None, "commit": None}
+            assert check_version(metadata.version(name), required)  # exception if requirements not met
+        except (AssertionError, metadata.PackageNotFoundError):
+            pkgs.append(r)
 
+    @Retry(times=2, delay=1)
+    def attempt_install(packages, commands):
+        """Attempt pip install command with retries on failure."""
+        return subprocess.check_output(f"pip install --no-cache-dir {packages} {commands}", shell=True).decode()
+
+    s = " ".join(f'"{x}"' for x in pkgs)  # console string
+    if s:
+        if install and AUTOINSTALL:  # check environment variable
+            n = len(pkgs)  # number of packages updates
+            LOGGER.info(f"{prefix} Ultralytics requirement{'s' * (n > 1)} {pkgs} not found, attempting AutoUpdate...")
+            try:
+                t = time.time()
+                LOGGER.info(attempt_install(s, cmds))
+                dt = time.time() - t
+                LOGGER.info(
+                    f"{prefix} AutoUpdate success ✅ {dt:.1f}s, installed {n} package{'s' * (n > 1)}: {pkgs}\n"
+                    f"{prefix} ⚠️ {colorstr('bold', 'Restart runtime or rerun command for updates to take effect')}\n"
+                )
+            except Exception as e:
+                LOGGER.warning(f"{prefix} ❌ {e}")
+                return False
+        else:
+            return False
+    return True
 
 def check_python(minimum="3.8.0"):
     """Checks if current Python version meets the minimum required version, exits if not."""
@@ -919,6 +1004,37 @@ def xyn2xy(x, w=640, h=640, padw=0, padh=0):
     y[..., 0] = w * x[..., 0] + padw  # top left x
     y[..., 1] = h * x[..., 1] + padh  # top left y
     return y
+
+
+def xywhr2xyxyxyxy(x):
+    """
+    Convert batched Oriented Bounding Boxes (OBB) from [xywh, rotation] to [xy1, xy2, xy3, xy4]. Rotation values should
+    be in degrees from 0 to 90.
+
+    Args:
+        x (numpy.ndarray | torch.Tensor): Boxes in [cx, cy, w, h, rotation] format of shape (n, 5) or (b, n, 5).
+
+    Returns:
+        (numpy.ndarray | torch.Tensor): Converted corner points of shape (n, 4, 2) or (b, n, 4, 2).
+    """
+    cos, sin, cat, stack = (
+        (torch.cos, torch.sin, torch.cat, torch.stack)
+        if isinstance(x, torch.Tensor)
+        else (np.cos, np.sin, np.concatenate, np.stack)
+    )
+
+    ctr = x[..., :2]
+    w, h, angle = (x[..., i : i + 1] for i in range(2, 5))
+    cos_value, sin_value = cos(angle), sin(angle)
+    vec1 = [w / 2 * cos_value, w / 2 * sin_value]
+    vec2 = [-h / 2 * sin_value, h / 2 * cos_value]
+    vec1 = cat(vec1, -1)
+    vec2 = cat(vec2, -1)
+    pt1 = ctr + vec1 + vec2
+    pt2 = ctr + vec1 - vec2
+    pt3 = ctr - vec1 - vec2
+    pt4 = ctr - vec1 + vec2
+    return stack([pt1, pt2, pt3, pt4], -2)
 
 
 def segment2box(segment, width=640, height=640):
