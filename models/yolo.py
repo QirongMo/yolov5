@@ -437,7 +437,7 @@ def parse_model(d, ch):
                 c2 = make_divisible(min(c2, max_channels) * gw, ch_mul)
 
             args = [c1, c2, *args[1:]]
-            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x, C2f, C2fCIB, C3k2}:
+            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x, C2f, C2fCIB, C3k2, C2PSA}:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
