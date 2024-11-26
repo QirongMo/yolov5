@@ -56,7 +56,7 @@ from utils.general import (
     xyxy2xywhn,
 )
 from utils.torch_utils import torch_distributed_zero_first
-from utils.yaml2yolo import yaml2yolo
+from utils.readAnno import readAnno
 
 # Parameters
 HELP_URL = "See https://docs.ultralytics.com/yolov5/tutorials/train_custom_data"
@@ -1195,7 +1195,7 @@ def verify_image_label(args):
         # verify labels
         if os.path.isfile(lb_file):
             nf = 1  # label found
-            lb = np.array(yaml2yolo(lb_file, class_names))
+            lb = np.array(readAnno(lb_file, class_names))
             nl = len(lb)
             if nl:
                 assert lb.shape[1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
