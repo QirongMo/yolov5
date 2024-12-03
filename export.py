@@ -68,7 +68,7 @@ if platform.system() != "Windows":
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 from models.experimental import attempt_load
-from models.yolo import ClassificationModel, Detect, DetectionModel, SegmentationModel
+from models.yolo import ClassificationModel, Detect, DetectionModel, SegmentationModel, DecoupledDetect
 from utils.dataloaders import LoadImages
 from utils.general import (
     LOGGER,
@@ -1300,6 +1300,7 @@ def run(
     topk_all=100,  # TF.js NMS: topk for all classes to keep
     iou_thres=0.45,  # TF.js NMS: IoU threshold
     conf_thres=0.25,  # TF.js NMS: confidence threshold
+    no_decode=False
 ):
     """
     Exports a YOLOv5 model to specified formats including ONNX, TensorRT, CoreML, and TensorFlow.
@@ -1398,18 +1399,21 @@ def run(
     # Update model
     model.eval()
     for k, m in model.named_modules():
-        if isinstance(m, Detect):
+        if isinstance(m, (Detect, DecoupledDetect)):
             m.inplace = inplace
             m.dynamic = dynamic
             m.export = True
+            m.no_decode = no_decode
 
     for _ in range(2):
         y = model(im)  # dry runs
+
     if half and not coreml:
         im, model = im.half(), model.half()  # to FP16
-    shape = tuple((y[0] if isinstance(y, tuple) else y).shape)  # model output shape
+    # shape = tuple((y[0] if isinstance(y, tuple) else y).shape)  # model output shape
     metadata = {"stride": int(max(model.stride)), "names": model.names}  # model metadata
-    LOGGER.info(f"\n{colorstr('PyTorch:')} starting from {file} with output shape {shape} ({file_size(file):.1f} MB)")
+    # LOGGER.info(f"\n{colorstr('PyTorch:')} starting from {file} with output shape {shape} ({file_size(file):.1f} MB)")
+    LOGGER.info(f"\n{colorstr('PyTorch:')} starting from {file} ({file_size(file):.1f} MB)")
 
     # Exports
     f = [""] * len(fmts)  # exported filenames
@@ -1530,6 +1534,7 @@ def parse_opt(known=False):
         default=["torchscript"],
         help="torchscript, onnx, openvino, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle",
     )
+    parser.add_argument("--no-decode", action="store_true", help="是否解码输出")
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
     print_args(vars(opt))
     return opt

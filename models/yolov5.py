@@ -56,10 +56,10 @@ class DecoupledDetect(nn.Module):
         z = []  # inference output
         for i in range(self.nl):
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
-            x[i] = torch.concat([m[i](x[i]).view(bs, self.na, -1, ny, nx).permute(0, 1, 3, 4, 2).contiguous() 
-                                 for m in self.m], -1)
+            x[i] = torch.concat([m[i](x[i]).view(bs, self.na, -1, ny, nx) for m in self.m], 2)
+            x[i] = x[i].permute(0, 1, 3, 4, 2).contiguous()
 
-            if not self.training:  # inference
+            if not self.training and not self.no_decode:  # inference
                 if self.dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
                     self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
 
